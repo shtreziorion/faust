@@ -4,6 +4,16 @@
 
 @implementation FaustAU_CustomView
 
+- (void)scheduleBuildRetry
+{
+    if (!mAU || uiBuilt || buildRetryScheduled) {
+        return;
+    }
+
+    buildRetryScheduled = true;
+    [self performSelector:@selector(buildUIIfReady) withObject:nil afterDelay:0.1];
+}
+
 // This listener responds to parameter changes, gestures, and property notifications
 void eventListenerDispatcher (void *inRefCon, void *inObject, const AudioUnitEvent *inEvent, UInt64 inHostTime, Float32 inValue)
 {
@@ -23,61 +33,73 @@ void addParamListener (AUEventListenerRef listener, void* refCon, AudioUnitEvent
 	verify_noerr ( AUEventListenerAddEventType(	listener, refCon, inEvent));
 }
 
+- (void)addParameterListenersForUI:(auUI*)dspUI
+{
+    if (parameterListenersAdded || !dspUI) {
+        return;
+    }
+
+    AudioUnitEvent auEvent;
+    for (int i = 0; i < dspUI->fUITable.size(); i++) {
+        if (dspUI->fUITable[i] && dspUI->fUITable[i]->fZone)
+        {
+            if (dynamic_cast<auButton*>(dspUI->fUITable[i])) {
+            }
+            else if (dynamic_cast<auToggleButton*>(dspUI->fUITable[i])) {
+            }
+            else if (dynamic_cast<auCheckButton*>(dspUI->fUITable[i])) {
+            }
+            else {
+                AudioUnitParameter parameter =
+                {
+                    mAU,
+                    (AudioUnitParameterID)i,
+                    kAudioUnitScope_Global,
+                    0
+                };
+                auEvent.mArgument.mParameter = parameter;
+                addParamListener(mAUEventListener, self, &auEvent);
+            }
+        }
+    }
+
+    parameterListenersAdded = true;
+}
+
 - (void)addListeners
 {
-    auUI* dspUI;
-    
     if (mAU) {
 		verify_noerr( AUEventListenerCreate(eventListenerDispatcher, self,
 											CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, 0.05, 0.05,
 											&mAUEventListener));
-        dspUI = [self dspUI];
-        
-		//add listeners
+
         AudioUnitEvent auEvent;
-        for (int i = 0; i < dspUI->fUITable.size(); i++)
-            if (dspUI->fUITable[i] && dspUI->fUITable[i]->fZone)
-            {
-                if (dynamic_cast<auButton*>(dspUI->fUITable[i])) {
-                }
-                else if (dynamic_cast<auToggleButton*>(dspUI->fUITable[i])) {
-                }
-                else if (dynamic_cast<auCheckButton*>(dspUI->fUITable[i])) {
-                }
-                else {
-                    AudioUnitParameter parameter =
-                    {
-                        mAU,
-                        i,
-                        kAudioUnitScope_Global,
-                        0 // mElement
-                    };
-                    auEvent.mArgument.mParameter = parameter;
-                    addParamListener (mAUEventListener, self, &auEvent);                }
-            }
-        
-		/* Add a listener for the changes in our custom property */
-		/* The Audio unit will send a property change when the unit is intialized */
-		auEvent.mEventType = kAudioUnitEvent_PropertyChange;
-		auEvent.mArgument.mProperty.mAudioUnit = mAU;
-		auEvent.mArgument.mProperty.mPropertyID = kAudioUnitCustomProperty_dspUI;
-		auEvent.mArgument.mProperty.mScope = kAudioUnitScope_Global;
-		auEvent.mArgument.mProperty.mElement = 0;
-		verify_noerr (AUEventListenerAddEventType (mAUEventListener, self, &auEvent));
+        auEvent.mEventType = kAudioUnitEvent_PropertyChange;
+        auEvent.mArgument.mProperty.mAudioUnit = mAU;
+        auEvent.mArgument.mProperty.mPropertyID = kAudioUnitCustomProperty_dspUI;
+        auEvent.mArgument.mProperty.mScope = kAudioUnitScope_Global;
+        auEvent.mArgument.mProperty.mElement = 0;
+        verify_noerr(AUEventListenerAddEventType(mAUEventListener, self, &auEvent));
+
+        [self addParameterListenersForUI:[self dspUI]];
 	}
 	
 }
 
 - (void)removeListeners
 {
+    NSLog(@"FaustAU_CustomView removeListeners");
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(buildUIIfReady) object:nil];
 	if (mAUEventListener) verify_noerr (AUListenerDispose(mAUEventListener));
 	mAUEventListener = NULL;
+    buildRetryScheduled = false;
+    parameterListenersAdded = false;
 	mAU = NULL;
 }
 
 - (auUI*) dspUI
 {
-    auUI* dspUI;
+    auUI* dspUI = NULL;
     UInt32 dataSize = sizeof(auUI*);
     ComponentResult result = AudioUnitGetProperty(mAU,
                                                   (AudioUnitPropertyID)kAudioUnitCustomProperty_dspUI,
@@ -85,6 +107,11 @@ void addParamListener (AUEventListenerRef listener, void* refCon, AudioUnitEvent
                                                   (AudioUnitElement)0, //inElement
                                                   (void*)&dspUI,
                                                   &dataSize);
+    if (result != noErr || dataSize != sizeof(auUI*)) {
+        NSLog(@"FaustAU_CustomView dspUI unavailable result=%d size=%u", (int)result, (unsigned)dataSize);
+        return NULL;
+    }
+    NSLog(@"FaustAU_CustomView dspUI=%p", dspUI);
     return dspUI;
 }
 
@@ -550,7 +577,18 @@ void addParamListener (AUEventListenerRef listener, void* refCon, AudioUnitEvent
 
 -(void)repaint
 {
+    NSLog(@"FaustAU_CustomView repaint");
     auUI* dspUI = [self dspUI];
+    if (!dspUI || !dspUI->boundingBox) {
+        return;
+    }
+
+    NSArray* subviews = [[self subviews] copy];
+    for (NSView* subview in subviews) {
+        [subview removeFromSuperview];
+    }
+    [subviews release];
+
     NSRect frame;
     
     NSPoint origin;
@@ -600,35 +638,59 @@ void addParamListener (AUEventListenerRef listener, void* refCon, AudioUnitEvent
     [self setNeedsDisplay:YES];
 }
 
-- (void)setAU:(AudioUnit)inAU
+- (BOOL)buildUIIfReady
 {
-	if (mAU)
-		[self removeListeners];
-    
-    mAU = inAU;
-    [self addListeners];
-    [self synchronizeUIWithParameterValues];
-    
+    buildRetryScheduled = false;
+    NSLog(@"FaustAU_CustomView buildUIIfReady");
+
     auUI* dspUI = [self dspUI];
-    
+    if (!dspUI || !dspUI->boundingBox) {
+        NSLog(@"FaustAU_CustomView buildUIIfReady not ready");
+        [self scheduleBuildRetry];
+        return NO;
+    }
+
+    [self addParameterListenersForUI:dspUI];
+
     usesBargraphs = false;
     for (int i = 0; i < dspUI->fUITable.size(); i++)
     {
-        if (dspUI->fUITable[i] && dspUI->fUITable[i]->fZone)
-        {
-            if (dynamic_cast<auBargraph*>(dspUI->fUITable[i]))
-                usesBargraphs = true;
+        if (dspUI->fUITable[i] && dspUI->fUITable[i]->fZone &&
+            dynamic_cast<auBargraph*>(dspUI->fUITable[i])) {
+            usesBargraphs = true;
             break;
         }
     }
-    
-    if (usesBargraphs)
-    {
+
+    if (usesBargraphs) {
         monitor = true;
         [self setTimer];
+    } else {
+        [self unsetTimer];
     }
+
+    if (!uiBuilt) {
+        [self repaint];
+        uiBuilt = true;
+        NSLog(@"FaustAU_CustomView UI built");
+    }
+
+    [self synchronizeUIWithParameterValues];
+    return YES;
+}
+
+- (void)setAU:(AudioUnit)inAU
+{
+    NSLog(@"FaustAU_CustomView setAU");
+	if (mAU)
+		[self removeListeners];
     
-    [self repaint];
+    uiBuilt = false;
+    buildRetryScheduled = false;
+    viewMap.clear();
+    mAU = inAU;
+    [self addListeners];
+    [self buildUIIfReady];
 }
 
 -(void)setTimer
@@ -660,7 +722,7 @@ void addParamListener (AUEventListenerRef listener, void* refCon, AudioUnitEvent
                   withObject:(id)object
 {
     [ (FaustAU_Knob*)object setDoubleValue :value ];
-    int paramId = [[object identifier] intValue];
+    AudioUnitParameterID paramId = (AudioUnitParameterID)[[object identifier] intValue];
     ComponentResult result = AudioUnitSetParameter(mAU,
                                                    paramId, //AudioUnitParameterID
                                                    kAudioUnitScope_Global,
@@ -714,7 +776,7 @@ void addParamListener (AUEventListenerRef listener, void* refCon, AudioUnitEvent
 - (void)buttonPushed:(id)sender
 {
     int state =  ((FaustAU_Button*)sender)->buttonState;
-    int paramId = [[sender identifier] intValue];
+    AudioUnitParameterID paramId = (AudioUnitParameterID)[[sender identifier] intValue];
     
     ComponentResult result = AudioUnitSetParameter(mAU,
                                                    paramId, //AudioUnitParameterID
@@ -782,7 +844,7 @@ void addParamListener (AUEventListenerRef listener, void* refCon, AudioUnitEvent
 - (void)paramChanged:(id)sender
 {
     float value =  [sender doubleValue]; //TODO
-    int paramId = [[sender identifier] intValue];
+    AudioUnitParameterID paramId = (AudioUnitParameterID)[[sender identifier] intValue];
     
     ComponentResult result = AudioUnitSetParameter(mAU,
                                                    paramId, //AudioUnitParameterID
@@ -806,6 +868,9 @@ void addParamListener (AUEventListenerRef listener, void* refCon, AudioUnitEvent
 - (void)synchronizeUIWithParameterValues
 {
     auUI* dspUI = [self dspUI];
+    if (!dspUI) {
+        return;
+    }
     
     NSView* subView = NULL;
     int paramId;
@@ -829,6 +894,12 @@ void addParamListener (AUEventListenerRef listener, void* refCon, AudioUnitEvent
 }
 
 - (void)eventListener:(void *) inObject event:(const AudioUnitEvent *)inEvent value:(Float32)inValue
-{}
+{
+    NSLog(@"FaustAU_CustomView eventListener type=%u property=%u", (unsigned)inEvent->mEventType, (unsigned)inEvent->mArgument.mProperty.mPropertyID);
+    if (inEvent->mEventType == kAudioUnitEvent_PropertyChange &&
+        inEvent->mArgument.mProperty.mPropertyID == kAudioUnitCustomProperty_dspUI) {
+        [self performSelectorOnMainThread:@selector(buildUIIfReady) withObject:nil waitUntilDone:NO];
+    }
+}
 
 @end
