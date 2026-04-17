@@ -58,22 +58,33 @@
 #define MAX_CONTROLS 1000
 
 #include <map>
+#include <vector>
 
 
 @interface FaustAU_CustomView : NSView <FaustAU_KnobProtocol, FaustAU_ButtonProtocol>
 {	
     AudioUnit mAU;
     NSTimer* timer;
+    NSScrollView* scrollView;
     bool monitor;
     bool usesBargraphs;
+    bool uiBuilt;
+    bool buildRetryScheduled;
+    bool parameterListenersAdded;
+    NSSize preferredViewSize;
     NSTextField* paramValues[MAX_CONTROLS];
     AUEventListenerRef mAUEventListener;
     std::map <int, NSView*> viewMap;
+    std::map <int, std::vector<double> > enumValueMap;
     std::map <NSButton*, NSBox*> showHideMap;
 }
 
 - (void)setAU:(AudioUnit)inAU;
+- (void)setPreferredSize:(NSSize)inPreferredSize;
 - (void)paramChanged:(id)sender;
+- (void)buttonEventChanged:(id)sender;
+- (void)enumControlChanged:(id)sender;
+- (void)scheduleBuildRetry;
 
 - (void)update;
 

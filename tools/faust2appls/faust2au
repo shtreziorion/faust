@@ -11,6 +11,8 @@
 CXXFLAGS+=" $MYGCCFLAGS"  # So that additional CXXFLAGS can be used
 
 PATH=$PATH:/usr/local/bin:/opt/homebrew/bin
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE_ARCHPATH="$(cd "$SCRIPT_DIR/../.." && pwd)/architecture"
 
 #-------------------------------------------------------------------------------
 # Search where Faust is installed. Store '.../share/faust/' in $FLIB
@@ -27,14 +29,89 @@ for f in $FPATH; do
 	fi
 done
 
+if [ -z "$ARCHPATH" ] && [ -d "$SOURCE_ARCHPATH/AU" ] && [ -d "$SOURCE_ARCHPATH/faust" ]; then
+	ARCHPATH="$SOURCE_ARCHPATH"
+fi
+
 if [ -z "$ARCHPATH" ]; then
 	ARCHPATH=$FLIB
 fi
 
-if [ -z "$FLIB" -o -z "$FINC" ]; then
-	echo "ERROR : $0 cannot find Faust directories (normally /usr/local/include/faust and /usr/local/share/faust)";
+if [ -z "$ARCHPATH" ]; then
+	echo "ERROR : $0 cannot find Faust architecture files";
+	echo "        Set ARCHPATH or install Faust so share/faust is available.";
 	exit 1;
 fi
+
+sanitize_class_token()
+{
+	local token
+	token=$(printf '%s' "$1" | perl -pe 's/[^A-Za-z0-9_]+/_/g; s/_+/_/g; s/^([^A-Za-z_])/_$1/;')
+	if [ -z "$token" ] || [ "$token" = "_" ]; then
+		token="faust"
+	fi
+	printf '%s' "$token"
+}
+
+sanitize_bundle_token()
+{
+	local token
+	token=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | perl -pe 's/[^a-z0-9.-]+/-/g; s/-+/-/g; s/\.+/./g; s/^[.-]+//; s/[.-]+$//;')
+	if [ -z "$token" ]; then
+		token="faust"
+	fi
+	printf '%s' "$token"
+}
+
+sanitize_fourcc()
+{
+	local token
+	local fallback="$2"
+	token=$(printf '%s' "$1" | tr -cd '[:alnum:]')
+	if [ -z "$token" ]; then
+		token="$fallback"
+	fi
+	token="${token}${fallback}"
+	printf '%.4s' "$token"
+}
+
+run_with_optional_output()
+{
+	if [ $DEBUG -eq 1 ]; then
+		"$@"
+	else
+		"$@" >/dev/null 2>&1
+	fi
+}
+
+run_logged_build()
+{
+	if [ $DEBUG -eq 1 ]; then
+		"$@" 2>&1 | tee ./build_errors.log
+	else
+		"$@" 2>&1 | tee ./build_errors.log > /dev/null
+	fi
+	return ${PIPESTATUS[0]}
+}
+
+replace_utf16_placeholders()
+{
+	local file="$1"
+	local utf8_tmp="${file}.utf8"
+	shift
+
+	iconv -f UTF-16 -t UTF-8 "$file" > "$utf8_tmp"
+
+	while [ $# -gt 1 ]; do
+		local search="$1"
+		local replace="$2"
+		shift 2
+		SEARCH="$search" REPLACE="$replace" perl -0pi -e 's/\Q$ENV{SEARCH}\E/$ENV{REPLACE}/g' "$utf8_tmp"
+	done
+
+	iconv -f UTF-8 -t UTF-16 "$utf8_tmp" > "$file"
+	rm -f "$utf8_tmp"
+}
 
 #-------------------------------------------------------------------------------
 #PHASE 1 : collects files and options from the command line
@@ -42,6 +119,7 @@ fi
 DEBUG=0
 INSTALLAU=0
 MANUFACTURER="Grame"
+CALL_DIR=$(pwd)
 
 while [[ $# -gt 0 ]]; do
 	p="$1"
@@ -92,22 +170,19 @@ while [[ $# -gt 0 ]]; do
 	fi
 done
 
-if [ $DEBUG -eq 1 ]; then
-	PRINTDEV=/dev/tty
-else
-	PRINTDEV=/dev/null
-fi
-
 #-------------------------------------------------------------------------------
 
 #PHASE 2 : compile the *.dsp files
 
 for f in $FILES; do
 
+	SOURCE_DIR="$(cd "$(dirname "$f")" && pwd)"
+	SOURCE_FILE="$SOURCE_DIR/$(basename "$f")"
+
 	# could use FILES for handling multiple dap files, while other AU args like manufacturer and subtype should be handled in a way
 
 	# Get the number of inputs of the Faust code:
-	LINPUTS=$(faust -uim "$f" | grep FAUST_INPUTS)
+	LINPUTS=$(faust -I "$SOURCE_DIR" -uim "$SOURCE_FILE" | grep FAUST_INPUTS)
 	NINPUTS=${LINPUTS//[^0-9]/}
 	# echo "Number of Faust module inputs = $NINPUTS"
 
@@ -131,7 +206,7 @@ for f in $FILES; do
 	export COMPTYPE
 
 	AU_DIR="${FAUST2AU_OUTPUT_DIR:-$HOME/Library/Audio/Plug-Ins/Components}"
-	TEMP_DIR="$(dirname "$f")/faustAUtmp.$(basename "$f")"
+	TEMP_DIR="$SOURCE_DIR/faustAUtmp.$(basename "$SOURCE_FILE")"
 
 	if [ -d "$TEMP_DIR" ]; then
 		rm -r "$TEMP_DIR"
@@ -139,118 +214,138 @@ for f in $FILES; do
 	mkdir -p "$TEMP_DIR"
 	mkdir -p "$AU_DIR"
 	cp -r "$ARCHPATH/AU"/* "$TEMP_DIR"
-	cp "$f" "$TEMP_DIR"
-	cp *.dsp "$TEMP_DIR" >/dev/null 2>&1
-	cp *.lib "$TEMP_DIR" >/dev/null 2>&1
+	cp "$SOURCE_FILE" "$TEMP_DIR"
+	for dep in "$SOURCE_DIR"/*.dsp "$SOURCE_DIR"/*.lib; do
+		[ -f "$dep" ] || continue
+		[ "$dep" = "$SOURCE_FILE" ] && continue
+		cp "$dep" "$TEMP_DIR"
+	done
 
 	cd "$TEMP_DIR"
 	mkdir Source >/dev/null 2>&1
+	mkdir -p LocalFaustHeaders
+	rm -rf LocalFaustHeaders/faust
+	cp -R "$ARCHPATH/faust" LocalFaustHeaders/
 
-	FULL_FILE_NAME=$f
+	FULL_FILE_NAME=$SOURCE_FILE
 
 	FILE_NAME=$(basename "$FULL_FILE_NAME")
 	EXTENSION="${FILE_NAME##*.}"
 	FILE_NAME="${FILE_NAME%.*}"
+	CLASS_TOKEN=$(sanitize_class_token "$FILE_NAME")
+	BUNDLE_TOKEN=$(sanitize_bundle_token "$FILE_NAME")
 	LOCAL_FILE="$FILE_NAME.$EXTENSION"
 
 	cp "$ARCHPATH/$ARCHFILE" au-arch-temp.cpp
-	perl -pi -e 's/FaustAU_CustomViewFactory/'FaustAU_"$FILE_NAME"CustomViewFactory'/g' au-arch-temp.cpp
-	perl -pi -e 's/FaustAU_CustomViewFactory/'FaustAU_"$FILE_NAME"CustomViewFactory'/g' FaustAUCustomView.plist
+	perl -pi -e 's/FaustAU_CustomViewFactory/'FaustAU_"$CLASS_TOKEN"CustomViewFactory'/g' au-arch-temp.cpp
+	perl -pi -e 's/FaustAU_CustomViewFactory/'FaustAU_"$CLASS_TOKEN"CustomViewFactory'/g' FaustAUCustomView.plist
+	perl -pi -e 's/_BUNDLE_ID_/'"$BUNDLE_TOKEN"'/g' FaustAUCustomView.plist
 
-	faust $OPTIONS -a au-arch-temp.cpp "$LOCAL_FILE" -o Source/au-output.cpp || exit 1
+	faust -I "$SOURCE_DIR" $OPTIONS -a au-arch-temp.cpp "$LOCAL_FILE" -o Source/au-output.cpp || exit 1
 
 	rm au-arch-temp.cpp
 
-	faust $OPTIONS -xml "$LOCAL_FILE" > "$PRINTDEV" 2>&1
+	run_with_optional_output faust -I "$SOURCE_DIR" $OPTIONS -xml "$LOCAL_FILE"
 	mv "$LOCAL_FILE.xml" Source/au-output.xml
 
 	if [ ! -f Source/au-output.cpp ]; then
 		echo FAUST could not generate cpp file
-		cd ..
+		cd "$CALL_DIR"
 		rm -r "$TEMP_DIR"
 		exit 1
 	fi
 
 	NAME="$MANUFACTURER: $FILE_NAME"
-	SUB_TYPE=$(echo "${FILE_NAME:0:4}" | tr '[:upper:]' '[:lower:]')
-	MANF=${MANUFACTURER:0:4}
+	SUB_TYPE=$(sanitize_fourcc "$FILE_NAME" "faus" | tr '[:upper:]' '[:lower:]')
+	MANF=$(sanitize_fourcc "$MANUFACTURER" "GRME")
 
 	perl -pi -e 's/_NAME_/'"$NAME"'/g' Info.plist
 	perl -pi -e 's/_DESC_/'"$NAME"'/g' Info.plist
 	perl -pi -e 's/_STYP_/'"$SUB_TYPE"'/g'	Info.plist
 	perl -pi -e 's/_MANF_/'"$MANF"'/g' Info.plist
-	perl -pi -e 's/_BUNDLE_ID_/'"$FILE_NAME"'/g' Info.plist
+	perl -pi -e 's/_BUNDLE_ID_/'"$BUNDLE_TOKEN"'/g' Info.plist
 	perl -pi -e 's/_TYPE_/'"$AUTYPE"'/g' Info.plist
 
-	perl -pi -e 's/_BUNDLE_NAME_/'"$FILE_NAME"'/g' English.lproj/InfoPlist.strings
-	perl -pi -e 's/_BUNDLE_INFO_/'"$NAME"'/g' English.lproj/InfoPlist.strings
+	replace_utf16_placeholders English.lproj/InfoPlist.strings \
+		_BUNDLE_NAME_ "$FILE_NAME" \
+		_BUNDLE_INFO_ "$NAME"
 
 	perl -pi -e 's/_NAME_/'"$NAME"'/g' Source/AUSource/FaustAU.r
 	perl -pi -e 's/_DESC_/'"$NAME"'/g' Source/AUSource/FaustAU.r
 	perl -pi -e 's/_COMPTYPE_/'"$COMPTYPE"'/g' Source/AUSource/FaustAU.r
 
 	perl -pi -e 's/_FaustAUClass_/'"$FAUSTAU_CLASS"'/g' Source/AUSource/FaustAU.h
-	perl -pi -e 's/_BUNDLE_ID_/'"$FILE_NAME"'/g' Source/AUSource/FaustAU.h
+	perl -pi -e 's/_BUNDLE_ID_/'"$BUNDLE_TOKEN"'/g' Source/AUSource/FaustAU.h
 
 	perl -pi -e 's/_STYP_/'"$SUB_TYPE"'/g' Source/AUSource/FaustAUVersion.h
 	perl -pi -e 's/_MANF_/'"$MANF"'/g' Source/AUSource/FaustAUVersion.h
 
 	perl -pi -e 's/_FILENAME_/'"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_CustomView.m
 
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_CustomView.h
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_CustomView.m
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_CustomViewFactory.h
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_CustomViewFactory.m
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_Bargraph.h
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_Bargraph.m
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_Button.h
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_Button.m
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_Knob.h
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_Knob.m
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_Slider.h
-	perl -pi -e 's/FaustAU_/'FaustAU_"$FILE_NAME"'/g' Source/CocoaUI/FaustAU_Slider.m
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_CustomView.h
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_CustomView.m
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_CustomViewFactory.h
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_CustomViewFactory.m
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_Bargraph.h
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_Bargraph.m
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_Button.h
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_Button.m
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_Knob.h
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_Knob.m
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_Slider.h
+	perl -pi -e 's/FaustAU_/'FaustAU_"$CLASS_TOKEN"'/g' Source/CocoaUI/FaustAU_Slider.m
 
-	perl -pi -e 's/FaustAU_CustomView.h/'FaustAU_"$FILE_NAME"CustomView.h'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_CustomView.m/'FaustAU_"$FILE_NAME"CustomView.m'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_CustomViewFactory.h/'FaustAU_"$FILE_NAME"CustomViewFactory.h'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_CustomViewFactory.m/'FaustAU_"$FILE_NAME"CustomViewFactory.m'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_Knob.h/'FaustAU_"$FILE_NAME"Knob.h'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_Knob.m/'FaustAU_"$FILE_NAME"Knob.m'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_Button.h/'FaustAU_"$FILE_NAME"Button.h'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_Button.m/'FaustAU_"$FILE_NAME"Button.m'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_Slider.h/'FaustAU_"$FILE_NAME"Slider.h'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_Slider.m/'FaustAU_"$FILE_NAME"Slider.m'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_Bargraph.h/'FaustAU_"$FILE_NAME"Bargraph.h'/g' FaustAU.xcodeproj/project.pbxproj
-	perl -pi -e 's/FaustAU_Bargraph.m/'FaustAU_"$FILE_NAME"Bargraph.m'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_CustomView.h/'FaustAU_"$CLASS_TOKEN"CustomView.h'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_CustomView.m/'FaustAU_"$CLASS_TOKEN"CustomView.m'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_CustomViewFactory.h/'FaustAU_"$CLASS_TOKEN"CustomViewFactory.h'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_CustomViewFactory.m/'FaustAU_"$CLASS_TOKEN"CustomViewFactory.m'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_Knob.h/'FaustAU_"$CLASS_TOKEN"Knob.h'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_Knob.m/'FaustAU_"$CLASS_TOKEN"Knob.m'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_Button.h/'FaustAU_"$CLASS_TOKEN"Button.h'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_Button.m/'FaustAU_"$CLASS_TOKEN"Button.m'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_Slider.h/'FaustAU_"$CLASS_TOKEN"Slider.h'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_Slider.m/'FaustAU_"$CLASS_TOKEN"Slider.m'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_Bargraph.h/'FaustAU_"$CLASS_TOKEN"Bargraph.h'/g' FaustAU.xcodeproj/project.pbxproj
+	perl -pi -e 's/FaustAU_Bargraph.m/'FaustAU_"$CLASS_TOKEN"Bargraph.m'/g' FaustAU.xcodeproj/project.pbxproj
+
+	if [ "$AUTYPE" = "aufx" ]; then
+		perl -ni -e 'print unless /F5A2F52718494D4600C7EB96 \/\* CoreMIDI\.framework in Frameworks \*\//' FaustAU.xcodeproj/project.pbxproj
+	fi
 
 
-	mv Source/CocoaUI/FaustAU_CustomView.h Source/CocoaUI/FaustAU_"$FILE_NAME"CustomView.h
-	mv Source/CocoaUI/FaustAU_CustomView.m Source/CocoaUI/FaustAU_"$FILE_NAME"CustomView.m
-	mv Source/CocoaUI/FaustAU_CustomViewFactory.h Source/CocoaUI/FaustAU_"$FILE_NAME"CustomViewFactory.h
-	mv Source/CocoaUI/FaustAU_CustomViewFactory.m Source/CocoaUI/FaustAU_"$FILE_NAME"CustomViewFactory.m
-	mv Source/CocoaUI/FaustAU_Bargraph.h Source/CocoaUI/FaustAU_"$FILE_NAME"Bargraph.h
-	mv Source/CocoaUI/FaustAU_Bargraph.m Source/CocoaUI/FaustAU_"$FILE_NAME"Bargraph.m
-	mv Source/CocoaUI/FaustAU_Button.h Source/CocoaUI/FaustAU_"$FILE_NAME"Button.h
-	mv Source/CocoaUI/FaustAU_Button.m Source/CocoaUI/FaustAU_"$FILE_NAME"Button.m
-	mv Source/CocoaUI/FaustAU_Knob.h Source/CocoaUI/FaustAU_"$FILE_NAME"Knob.h
-	mv Source/CocoaUI/FaustAU_Knob.m Source/CocoaUI/FaustAU_"$FILE_NAME"Knob.m
-	mv Source/CocoaUI/FaustAU_Slider.h Source/CocoaUI/FaustAU_"$FILE_NAME"Slider.h
-	mv Source/CocoaUI/FaustAU_Slider.m Source/CocoaUI/FaustAU_"$FILE_NAME"Slider.m
+	mv Source/CocoaUI/FaustAU_CustomView.h Source/CocoaUI/FaustAU_"$CLASS_TOKEN"CustomView.h
+	mv Source/CocoaUI/FaustAU_CustomView.m Source/CocoaUI/FaustAU_"$CLASS_TOKEN"CustomView.m
+	mv Source/CocoaUI/FaustAU_CustomViewFactory.h Source/CocoaUI/FaustAU_"$CLASS_TOKEN"CustomViewFactory.h
+	mv Source/CocoaUI/FaustAU_CustomViewFactory.m Source/CocoaUI/FaustAU_"$CLASS_TOKEN"CustomViewFactory.m
+	mv Source/CocoaUI/FaustAU_Bargraph.h Source/CocoaUI/FaustAU_"$CLASS_TOKEN"Bargraph.h
+	mv Source/CocoaUI/FaustAU_Bargraph.m Source/CocoaUI/FaustAU_"$CLASS_TOKEN"Bargraph.m
+	mv Source/CocoaUI/FaustAU_Button.h Source/CocoaUI/FaustAU_"$CLASS_TOKEN"Button.h
+	mv Source/CocoaUI/FaustAU_Button.m Source/CocoaUI/FaustAU_"$CLASS_TOKEN"Button.m
+	mv Source/CocoaUI/FaustAU_Knob.h Source/CocoaUI/FaustAU_"$CLASS_TOKEN"Knob.h
+	mv Source/CocoaUI/FaustAU_Knob.m Source/CocoaUI/FaustAU_"$CLASS_TOKEN"Knob.m
+	mv Source/CocoaUI/FaustAU_Slider.h Source/CocoaUI/FaustAU_"$CLASS_TOKEN"Slider.h
+	mv Source/CocoaUI/FaustAU_Slider.m Source/CocoaUI/FaustAU_"$CLASS_TOKEN"Slider.m
 
 	XCODE_ARGS=(
 		-project FaustAU.xcodeproj
-		HEADER_SEARCH_PATHS="$FINC"
+		-target FaustAU
+		HEADER_SEARCH_PATHS="$TEMP_DIR/LocalFaustHeaders $FINC"
 		CONFIGURATION_BUILD_DIR="$AU_DIR"
+		OBJROOT="$TEMP_DIR/DerivedData/Intermediates.noindex"
+		SYMROOT="$TEMP_DIR/DerivedData/Products"
+		CLANG_MODULE_CACHE_PATH="$TEMP_DIR/DerivedData/ModuleCache.noindex"
+		MODULE_CACHE_DIR="$TEMP_DIR/DerivedData/ModuleCache.noindex"
+		SHARED_PRECOMPS_DIR="$TEMP_DIR/DerivedData/SharedPrecompiledHeaders"
 	)
 	if [ -n "$FAUST2AU_ARCHS" ]; then
 		XCODE_ARGS+=(ARCHS="$FAUST2AU_ARCHS")
 	fi
-	xcodebuild "${XCODE_ARGS[@]}" 2>&1 | tee ./build_errors.log > "$PRINTDEV"
-	[ "${PIPESTATUS[0]}" -eq 0 ] || exit 1
+	run_logged_build xcodebuild "${XCODE_ARGS[@]}"
+	[ "$?" -eq 0 ] || exit 1
 
 	if [ ! -d "$AU_DIR/FaustAU.component/" ]; then
 		echo Unable to generate Audio Unit
-		cd ..
+		cd "$CALL_DIR"
 		if [ $DEBUG -eq 0 ]; then
 			rm -r "$TEMP_DIR"
 		fi
@@ -269,7 +364,7 @@ for f in $FILES; do
 		rm -r "$AU_DIR/FaustAUCustomView.bundle/"
 	fi
 
-	cd ..
+	cd "$CALL_DIR"
 	if [ $DEBUG -eq 0 ]; then
 		rm -r "$TEMP_DIR"
 	fi
@@ -281,7 +376,10 @@ for f in $FILES; do
 	fi
 
 	if [ $INSTALLAU -eq 0 ]; then
-		mv "$AU_DIR/$FILE_NAME.component" .
+		if [ -d "./$FILE_NAME.component" ]; then
+			rm -rf "./$FILE_NAME.component"
+		fi
+		mv "$AU_DIR/$FILE_NAME.component" . || exit 1
 		echo "./$FILE_NAME.component;"
 	else
 		echo "$AU_DIR/$FILE_NAME.component;"

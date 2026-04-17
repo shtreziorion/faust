@@ -23,7 +23,7 @@ enum
 };
 
 #define CUSTOM_VIEW_BUNDLE_ID "FaustAUCustomView"
-#define CUSTOM_VIEW_BUNDLE_NAME "com.grame.audiounit.FaustAU"
+#define CUSTOM_VIEW_BUNDLE_NAME "com.grame.audiounit._BUNDLE_ID_"
 
 #endif
 

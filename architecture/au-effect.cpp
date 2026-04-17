@@ -397,7 +397,7 @@ OSStatus FaustAUEffect::GetProperty(AudioUnitPropertyID inID,
         case kAudioUnitProperty_CocoaUI:
         {
             // Look for a resource in the main bundle by name and type.
-            CFBundleRef bundle = CFBundleGetBundleWithIdentifier( CFSTR("com.grame.audiounit.FaustAU") );
+            CFBundleRef bundle = CFBundleGetBundleWithIdentifier(CFSTR(CUSTOM_VIEW_BUNDLE_NAME));
             if (bundle == NULL) return fnfErr;
 
             CFURLRef bundleURL = CFBundleCopyResourceURL( bundle,

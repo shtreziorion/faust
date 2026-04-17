@@ -5,7 +5,7 @@
 	<key>CFBundleExecutable</key>
 	<string>FaustAUCustomView</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.grame.audiounit.FaustAU</string>
+	<string>com.grame.audiounit._BUNDLE_ID_.view</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>NSPrincipalClass</key>

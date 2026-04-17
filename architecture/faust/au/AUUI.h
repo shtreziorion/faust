@@ -236,10 +236,11 @@ struct auBox: public auUIObject {
     
 	std::vector<auUIObject*> fChildren;
     bool fIsVertical;
+    bool fIsTabBox;
     auBox* parent;
     
-	auBox(const char* label, auBox* inParent, bool inIsVertical) :
-    auUIObject(label, NULL), parent(inParent), fIsVertical(inIsVertical)
+	auBox(const char* label, auBox* inParent, bool inIsVertical, bool inIsTabBox = false) :
+    auUIObject(label, NULL), fIsVertical(inIsVertical), fIsTabBox(inIsTabBox), parent(inParent)
     {}
     
     virtual ~auBox()
@@ -273,6 +274,11 @@ struct auUI : public UI, public MetaDataUI {
 			delete *iter;
         // TODO delete boxes
 	}
+
+    void declare(FAUSTFLOAT* zone, const char* key, const char* value)
+    {
+        MetaDataUI::declare(zone, key, value);
+    }
     
     void addButton(const char* label, FAUSTFLOAT* zone)
     {
@@ -282,7 +288,11 @@ struct auUI : public UI, public MetaDataUI {
     }
     
     void openTabBox(const char* label)
-    {}
+    {
+        auBox* box = new auBox(label, currentBox, true, true);
+        currentBox->add(box);
+        currentBox = box;
+    }
     
     void addCheckButton(const char* label, FAUSTFLOAT* zone)
     {
